@@ -28,6 +28,7 @@
 #include <faiss/svs/IndexSVSVamana.h> // for SVSStorageKind, to_svs_storage_kind
 
 #include <svs/runtime/api_defs.h>
+#include <svs/runtime/dynamic_ivf_index.h>
 
 #include <iostream>
 
