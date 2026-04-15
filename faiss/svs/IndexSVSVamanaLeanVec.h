@@ -35,7 +35,8 @@ struct IndexSVSVamanaLeanVec : IndexSVSVamana {
             size_t degree,
             MetricType metric = METRIC_L2,
             size_t leanvec_dims = 0,
-            SVSStorageKind storage = SVSStorageKind::SVS_LeanVec4x4);
+            SVSStorageKind storage = SVSStorageKind::SVS_LeanVec4x4,
+            bool primary_only = false);
 
     ~IndexSVSVamanaLeanVec() override;
 
@@ -59,8 +60,14 @@ struct IndexSVSVamanaLeanVec : IndexSVSVamana {
 
     void serialize_training_data(std::ostream& out) const;
     void deserialize_training_data(std::istream& in);
+    void deserialize_impl(std::istream& in) override;
 
     size_t leanvec_d;
+
+    /// When true, only the reduced-dimension primary data is used for both
+    /// graph traversal and scoring (no reranking with full-dimension data).
+    /// Reduces memory usage at the cost of recall accuracy.
+    bool primary_only = false;
 
     /* Training information */
     svs_runtime::LeanVecTrainingData* training_data{nullptr};

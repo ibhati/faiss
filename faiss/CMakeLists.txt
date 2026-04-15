@@ -162,6 +162,7 @@ if(FAISS_ENABLE_SVS)
     svs/IndexSVSVamanaLVQ.cpp
     svs/IndexSVSVamanaLeanVec.cpp
     svs/IndexSVSIVF.cpp
+    svs/IndexSVSVamanaSSD.cpp
     svs/IndexSVSIVFLVQ.cpp
     svs/IndexSVSIVFLeanVec.cpp
     impl/svs_io.cpp
@@ -351,6 +352,7 @@ if(FAISS_ENABLE_SVS)
     svs/IndexSVSVamanaLVQ.h
     svs/IndexSVSVamanaLeanVec.h
     svs/IndexSVSIVF.h
+    svs/IndexSVSVamanaSSD.h
     svs/IndexSVSIVFLVQ.h
     svs/IndexSVSIVFLeanVec.h
   )
@@ -491,7 +493,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)")
 endif()
 
 if(FAISS_ENABLE_SVS)
-  find_package(svs_runtime REQUIRED)
+  find_package(svs_runtime QUIET)
+  if(NOT svs_runtime_FOUND)
+    message(STATUS "svs_runtime not found locally, downloading from: ${SVS_RUNTIME_URL}")
+    include(FetchContent)
+    FetchContent_Declare(
+      svs_runtime_pkg
+      URL ${SVS_RUNTIME_URL}
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(svs_runtime_pkg)
+    find_package(svs_runtime REQUIRED
+      PATHS "${svs_runtime_pkg_SOURCE_DIR}/lib/cmake/svs_runtime"
+      NO_DEFAULT_PATH
+    )
+  endif()
 
   target_link_libraries(faiss PUBLIC svs::svs_runtime)
   target_link_libraries(faiss_avx2 PUBLIC svs::svs_runtime)
@@ -499,7 +515,15 @@ if(FAISS_ENABLE_SVS)
   target_link_libraries(faiss_avx512_spr PUBLIC svs::svs_runtime)
   target_link_libraries(faiss_sve PUBLIC svs::svs_runtime)
 
-  install(DIRECTORY ${svs_SOURCE_DIR}/lib/ DESTINATION ${CMAKE_INSTALL_LIBDIR} FILES_MATCHING PATTERN "libsvs_runtime.so*")
+  get_target_property(_svs_loc svs::svs_runtime IMPORTED_LOCATION_RELWITHDEBUGINFO)
+  if(NOT _svs_loc)
+    get_target_property(_svs_loc svs::svs_runtime IMPORTED_LOCATION_RELEASE)
+  endif()
+  if(_svs_loc)
+    get_filename_component(_svs_lib_dir "${_svs_loc}" DIRECTORY)
+    install(DIRECTORY ${_svs_lib_dir}/ DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            FILES_MATCHING PATTERN "libsvs_runtime.so*")
+  endif()
 endif()
 
 # Handle `#include <faiss/foo.h>`.
