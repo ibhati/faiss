@@ -215,6 +215,7 @@ typedef uint64_t size_t;
 #include <faiss/svs/IndexSVSFlat.h>
 #include <faiss/svs/IndexSVSVamanaLVQ.h>
 #include <faiss/svs/IndexSVSVamanaLeanVec.h>
+#include <faiss/svs/IndexSVSVamanaSSD.h>
 #include <faiss/svs/IndexSVSIVF.h>
 #include <faiss/svs/IndexSVSIVFLVQ.h>
 #include <faiss/svs/IndexSVSIVFLeanVec.h>
@@ -700,11 +701,15 @@ void gpu_sync_all_devices()
 
 #ifdef FAISS_ENABLE_SVS
 %ignore faiss::to_svs_storage_kind;
+%ignore faiss::IndexSVSVamanaSSD::impl;
+%ignore faiss::IndexSVSVamanaSSD::save_index_to_directory;
+%ignore faiss::IndexSVSVamanaSSD::assemble;
 
 %include  <faiss/svs/IndexSVSVamana.h>
 %include  <faiss/svs/IndexSVSFlat.h>
 %include  <faiss/svs/IndexSVSVamanaLVQ.h>
 %include  <faiss/svs/IndexSVSVamanaLeanVec.h>
+%include  <faiss/svs/IndexSVSVamanaSSD.h>
 %include  <faiss/svs/IndexSVSIVF.h>
 %include  <faiss/svs/IndexSVSIVFLVQ.h>
 %include  <faiss/svs/IndexSVSIVFLeanVec.h>
@@ -847,6 +852,7 @@ void gpu_sync_all_devices()
     DOWNCAST ( IndexSVSFlat )
     DOWNCAST ( IndexSVSVamanaLeanVec )
     DOWNCAST ( IndexSVSVamanaLVQ )
+    DOWNCAST ( IndexSVSVamanaSSD )
     DOWNCAST ( IndexSVSVamana )
     DOWNCAST ( IndexSVSIVFLeanVec )
     DOWNCAST ( IndexSVSIVFLVQ )

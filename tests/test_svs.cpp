@@ -32,7 +32,11 @@
 #include <faiss/svs/IndexSVSVamana.h>
 #include <faiss/svs/IndexSVSVamanaLVQ.h>
 #include <faiss/svs/IndexSVSVamanaLeanVec.h>
+#include <faiss/svs/IndexSVSVamanaSSD.h>
+#include <svs/runtime/training.h>
+#include <svs/runtime/vamana_index.h>
 #include <gtest/gtest.h>
+#include <filesystem>
 #include <random>
 #include <type_traits>
 
@@ -126,6 +130,7 @@ void write_and_read_index(T& index, const std::vector<float>& xb, size_t n) {
                 dynamic_cast<faiss::IndexSVSVamanaLeanVec*>(loaded);
         ASSERT_NE(leanvec_loaded, nullptr);
         EXPECT_EQ(leanvec_loaded->leanvec_d, index.leanvec_d);
+        EXPECT_EQ(leanvec_loaded->primary_only, index.primary_only);
 
         EXPECT_NE(leanvec_loaded->training_data, nullptr);
     }
@@ -234,6 +239,97 @@ TEST_F(SVSLL, WriteAndReadIndexSVSVamanaLeanVec8x8) {
             0,
             faiss::SVSStorageKind::SVS_LeanVec8x8};
     write_and_read_index(index, test_data, n);
+}
+
+// --- Primary-only LeanVec tests ---
+
+TEST_F(SVSLL, WriteAndReadPrimaryOnlyLeanVec4x4) {
+    faiss::IndexSVSVamanaLeanVec index{
+            d,
+            64ul,
+            faiss::METRIC_L2,
+            0,
+            faiss::SVSStorageKind::SVS_LeanVec4x4,
+            /*primary_only=*/true};
+    EXPECT_TRUE(index.primary_only);
+    write_and_read_index(index, test_data, n);
+}
+
+TEST_F(SVSLL, WriteAndReadPrimaryOnlyLeanVec4x8) {
+    faiss::IndexSVSVamanaLeanVec index{
+            d,
+            64ul,
+            faiss::METRIC_L2,
+            0,
+            faiss::SVSStorageKind::SVS_LeanVec4x8,
+            /*primary_only=*/true};
+    write_and_read_index(index, test_data, n);
+}
+
+TEST_F(SVSLL, PrimaryOnlyLeanVecBuildAndSearch) {
+    faiss::IndexSVSVamanaLeanVec index{
+            d,
+            64ul,
+            faiss::METRIC_L2,
+            0,
+            faiss::SVSStorageKind::SVS_LeanVec4x4,
+            /*primary_only=*/true};
+    index.train(n, test_data.data());
+    index.add(n, test_data.data());
+
+    // Self-recall: search for vectors we just inserted
+    constexpr int nq = 10;
+    constexpr int k = 5;
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+    ASSERT_NO_THROW(index.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+
+    // Each query should find itself as nearest neighbor (self-recall)
+    for (int q = 0; q < nq; ++q) {
+        EXPECT_EQ(labels[q * k], q)
+                << "query " << q << " did not find itself as nearest neighbor";
+    }
+}
+
+TEST_F(SVSLL, PrimaryOnlyLeanVecRemoveIds) {
+    faiss::IndexSVSVamanaLeanVec index{
+            d,
+            64ul,
+            faiss::METRIC_L2,
+            0,
+            faiss::SVSStorageKind::SVS_LeanVec4x4,
+            /*primary_only=*/true};
+    index.train(n, test_data.data());
+    index.add(n, test_data.data());
+    EXPECT_EQ(index.ntotal, static_cast<faiss::idx_t>(n));
+
+    // Remove first 10 IDs
+    faiss::IDSelectorRange selector(0, 10);
+    size_t removed = index.remove_ids(selector);
+    EXPECT_EQ(removed, 10);
+    EXPECT_EQ(index.ntotal, static_cast<faiss::idx_t>(n - 10));
+
+    // Search should not return removed IDs
+    constexpr int k = 5;
+    std::vector<float> distances(k);
+    std::vector<faiss::idx_t> labels(k);
+    index.search(1, test_data.data(), k, distances.data(), labels.data());
+    for (int i = 0; i < k; ++i) {
+        EXPECT_GE(labels[i], 10)
+                << "Removed ID " << labels[i] << " still returned in search";
+    }
+}
+
+TEST_F(SVSLL, PrimaryOnlyLeanVecTrainSaveLoadAndAdd) {
+    faiss::IndexSVSVamanaLeanVec index{
+            d,
+            64ul,
+            faiss::METRIC_L2,
+            0,
+            faiss::SVSStorageKind::SVS_LeanVec4x4,
+            /*primary_only=*/true};
+    train_save_load_and_add_index(index, test_data, n);
 }
 
 TEST_F(SVSLL, LeanVecThrowsWithoutTraining) {
@@ -812,4 +908,298 @@ TEST_F(SVS, StaticIVFRemoveThrows) {
     index.train(n, test_data.data());
     faiss::IDSelectorRange selector(0, 10);
     ASSERT_THROW(index.remove_ids(selector), faiss::FaissException);
+}
+
+// --- IndexSVSVamanaSSD Tests ---
+
+namespace {
+// Helper: build a static VamanaIndex via the SVS runtime API, add data,
+// save to a temp directory. Returns the path to the saved directory.
+// Uses the SVS runtime directly (not IndexSVSVamana which uses DynamicVamana).
+std::string prepare_ssd_index_dir(
+        faiss::idx_t d,
+        size_t n,
+        const float* data,
+        faiss::MetricType metric,
+        faiss::SVSStorageKind storage) {
+    auto svs_metric = faiss::to_svs_metric(metric);
+    auto svs_storage = faiss::to_svs_storage_kind(storage);
+
+    // Build a static VamanaIndex
+    svs_runtime::VamanaIndex* vindex = nullptr;
+    svs_runtime::VamanaIndex::BuildParams bp{};
+    bp.graph_max_degree = 64;
+    auto status = svs_runtime::VamanaIndex::build(
+            &vindex, d, svs_metric, svs_storage, bp);
+    EXPECT_TRUE(status.ok()) << status.message();
+    EXPECT_NE(vindex, nullptr);
+
+    status = vindex->add(n, data);
+    EXPECT_TRUE(status.ok()) << status.message();
+
+    // Create temp dir and save
+    auto dir = std::string("/tmp/faiss_svs_ssd_test");
+    std::filesystem::create_directories(dir);
+    for (auto& entry : std::filesystem::directory_iterator(dir)) {
+        std::filesystem::remove_all(entry.path());
+    }
+
+    status = vindex->save_to_directory(dir.c_str());
+    EXPECT_TRUE(status.ok()) << status.message();
+
+    svs_runtime::VamanaIndex::destroy(vindex);
+    return dir;
+}
+
+std::string prepare_ssd_index_dir_leanvec(
+        faiss::idx_t d,
+        size_t n,
+        const float* data,
+        faiss::MetricType metric,
+        faiss::SVSStorageKind storage,
+        size_t leanvec_dims) {
+    // LeanVec requires training, so we use the FAISS wrapper which handles it.
+    faiss::IndexSVSVamanaLeanVec builder{d, 64ul, metric, leanvec_dims, storage};
+    builder.train(n, data);
+    builder.add(n, data);
+
+    auto dir = std::string("/tmp/faiss_svs_ssd_leanvec_test");
+    std::filesystem::create_directories(dir);
+    for (auto& entry : std::filesystem::directory_iterator(dir)) {
+        std::filesystem::remove_all(entry.path());
+    }
+
+    // DynamicVamana save_to_directory also works — the static assemble
+    // handles both config formats. Actually, we need to use the static
+    // VamanaIndex save. Let's use the LeanVec-specific build.
+    auto svs_metric = faiss::to_svs_metric(metric);
+    auto svs_storage = faiss::to_svs_storage_kind(storage);
+
+    svs_runtime::VamanaIndex* vindex = nullptr;
+    svs_runtime::VamanaIndex::BuildParams bp{};
+    bp.graph_max_degree = 64;
+    svs_runtime::VamanaIndex::SearchParams sp{};
+    size_t lv_d = leanvec_dims == 0 ? d / 2 : leanvec_dims;
+
+    // Build static VamanaIndex with LeanVec training data
+    svs_runtime::LeanVecTrainingData* tdata = nullptr;
+    auto status = svs_runtime::LeanVecTrainingData::build(
+            &tdata, d, n, data, 0, nullptr, lv_d);
+    EXPECT_TRUE(status.ok()) << status.message();
+
+    status = svs_runtime::VamanaIndexLeanVec::build(
+            &vindex, d, svs_metric, svs_storage, tdata, bp, sp);
+    EXPECT_TRUE(status.ok()) << status.message();
+    EXPECT_NE(vindex, nullptr);
+
+    status = vindex->add(n, data);
+    EXPECT_TRUE(status.ok()) << status.message();
+
+    status = vindex->save_to_directory(dir.c_str());
+    EXPECT_TRUE(status.ok()) << status.message();
+
+    svs_runtime::VamanaIndex::destroy(vindex);
+    svs_runtime::LeanVecTrainingData::destroy(tdata);
+    return dir;
+}
+} // namespace
+
+TEST_F(SVS, SSDIndex_FP32_RAM) {
+    auto dir = prepare_ssd_index_dir(
+            d, n, test_data.data(), faiss::METRIC_L2, faiss::SVS_FP32);
+
+    // Load as SSD index in RAM mode (default)
+    faiss::IndexSVSVamanaSSD ssd_idx{
+            d, faiss::METRIC_L2, faiss::SVS_FP32, dir.c_str()};
+    ASSERT_NE(ssd_idx.impl, nullptr);
+
+    // Search
+    constexpr int nq = 5;
+    constexpr int k = 5;
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+    ASSERT_NO_THROW(ssd_idx.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+
+    // Each query should find itself as nearest neighbor
+    for (int q = 0; q < nq; ++q) {
+        EXPECT_EQ(labels[q * k], q);
+    }
+}
+
+TEST_F(SVS, SSDIndex_AddThrows) {
+    auto dir = prepare_ssd_index_dir(
+            d, n, test_data.data(), faiss::METRIC_L2, faiss::SVS_FP32);
+
+    faiss::IndexSVSVamanaSSD ssd_idx{
+            d, faiss::METRIC_L2, faiss::SVS_FP32, dir.c_str()};
+    ASSERT_THROW(ssd_idx.add(1, test_data.data()), faiss::FaissException);
+}
+
+TEST_F(SVS, SSDIndex_InvalidPath) {
+    ASSERT_THROW(
+            faiss::IndexSVSVamanaSSD(
+                    d,
+                    faiss::METRIC_L2,
+                    faiss::SVS_FP32,
+                    "/nonexistent/path/test"),
+            faiss::FaissException);
+}
+
+TEST_F(SVSLL, SSDIndex_LVQ4x8_RAM) {
+    auto dir = prepare_ssd_index_dir(
+            d, n, test_data.data(), faiss::METRIC_L2, faiss::SVS_LVQ4x8);
+
+    faiss::IndexSVSVamanaSSD ssd_idx{
+            d, faiss::METRIC_L2, faiss::SVS_LVQ4x8, dir.c_str()};
+    ASSERT_NE(ssd_idx.impl, nullptr);
+
+    constexpr int nq = 5;
+    constexpr int k = 5;
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+    ASSERT_NO_THROW(ssd_idx.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+}
+
+TEST_F(SVSLL, SSDIndex_LVQ4x8_SSD_BOTH) {
+    auto dir = prepare_ssd_index_dir(
+            d, n, test_data.data(), faiss::METRIC_L2, faiss::SVS_LVQ4x8);
+
+    // Load with SSD_BOTH mode — data memory-mapped from /tmp
+    faiss::IndexSVSVamanaSSD ssd_idx{
+            d,
+            faiss::METRIC_L2,
+            faiss::SVS_LVQ4x8,
+            dir.c_str(),
+            "/tmp",                       // ssd_path
+            faiss::SVS_PLACEMENT_SSD,     // primary
+            faiss::SVS_PLACEMENT_SSD};    // secondary
+    ASSERT_NE(ssd_idx.impl, nullptr);
+
+    constexpr int nq = 5;
+    constexpr int k = 5;
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+    ASSERT_NO_THROW(ssd_idx.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+}
+
+TEST_F(SVSLL, SSDIndex_LeanVec4x4_RAM) {
+    auto dir = prepare_ssd_index_dir_leanvec(
+            d,
+            n,
+            test_data.data(),
+            faiss::METRIC_L2,
+            faiss::SVS_LeanVec4x4,
+            0);
+
+    faiss::IndexSVSVamanaSSD ssd_idx{
+            d, faiss::METRIC_L2, faiss::SVS_LeanVec4x4, dir.c_str()};
+    ASSERT_NE(ssd_idx.impl, nullptr);
+
+    constexpr int nq = 5;
+    constexpr int k = 5;
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+    ASSERT_NO_THROW(ssd_idx.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+}
+
+TEST_F(SVSLL, SSDIndex_LeanVec4x4_SSD_BOTH) {
+    auto dir = prepare_ssd_index_dir_leanvec(
+            d,
+            n,
+            test_data.data(),
+            faiss::METRIC_L2,
+            faiss::SVS_LeanVec4x4,
+            0);
+
+    faiss::IndexSVSVamanaSSD ssd_idx{
+            d,
+            faiss::METRIC_L2,
+            faiss::SVS_LeanVec4x4,
+            dir.c_str(),
+            "/tmp",
+            faiss::SVS_PLACEMENT_SSD,
+            faiss::SVS_PLACEMENT_SSD};
+    ASSERT_NE(ssd_idx.impl, nullptr);
+
+    constexpr int nq = 5;
+    constexpr int k = 5;
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+    ASSERT_NO_THROW(ssd_idx.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+}
+
+TEST_F(SVSLL, SSDIndex_LeanVec4x4_PrimaryOnly) {
+    auto dir = prepare_ssd_index_dir_leanvec(
+            d,
+            n,
+            test_data.data(),
+            faiss::METRIC_L2,
+            faiss::SVS_LeanVec4x4,
+            0);
+
+    // Load as primary-only — skips secondary data, no reranking
+    faiss::IndexSVSVamanaSSD ssd_idx{
+            d,
+            faiss::METRIC_L2,
+            faiss::SVS_LeanVec4x4,
+            dir.c_str(),
+            "",                           // no SSD path
+            faiss::SVS_PLACEMENT_RAM,     // primary
+            faiss::SVS_PLACEMENT_RAM,     // secondary (ignored)
+            10,                           // search_window
+            10,                           // search_buffer
+            /*primary_only=*/true};
+    ASSERT_NE(ssd_idx.impl, nullptr);
+    EXPECT_TRUE(ssd_idx.primary_only);
+
+    constexpr int nq = 5;
+    constexpr int k = 5;
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+    ASSERT_NO_THROW(ssd_idx.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+}
+
+TEST_F(SVS, SSDIndex_RangeSearch) {
+    auto dir = prepare_ssd_index_dir(
+            d, n, test_data.data(), faiss::METRIC_L2, faiss::SVS_FP32);
+
+    faiss::IndexSVSVamanaSSD ssd_idx{
+            d,
+            faiss::METRIC_L2,
+            faiss::SVS_FP32,
+            dir.c_str(),
+            "",
+            faiss::SVS_PLACEMENT_RAM,
+            faiss::SVS_PLACEMENT_RAM,
+            50,  // search_window
+            50}; // search_buffer
+
+    faiss::RangeSearchResult result(5);
+    ASSERT_NO_THROW(
+            ssd_idx.range_search(5, test_data.data(), 5.0f, &result));
+}
+
+TEST_F(SVS, SSDIndex_CustomSearchParams) {
+    auto dir = prepare_ssd_index_dir(
+            d, n, test_data.data(), faiss::METRIC_L2, faiss::SVS_FP32);
+
+    faiss::IndexSVSVamanaSSD ssd_idx{
+            d, faiss::METRIC_L2, faiss::SVS_FP32, dir.c_str()};
+
+    faiss::SearchParametersSVSVamanaSSD sp;
+    sp.search_window_size = 50;
+    sp.search_buffer_capacity = 100;
+
+    constexpr int nq = 5;
+    constexpr int k = 5;
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+    ASSERT_NO_THROW(ssd_idx.search(
+            nq, test_data.data(), k, distances.data(), labels.data(), &sp));
 }

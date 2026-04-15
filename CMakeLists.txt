@@ -71,6 +71,8 @@ option(FAISS_USE_LTO "Enable Link-Time optimization" OFF)
 option(FAISS_ENABLE_SVS "Enable SVS (Intel(R) Scalable Vector Search) integration." OFF)
 set(FAISS_SVS_RUNTIME_VERSION "v0" CACHE STRING "Version of the SVS runtime API to use")
 set_property(CACHE FAISS_SVS_RUNTIME_VERSION PROPERTY STRINGS "v0")
+set(SVS_RUNTIME_URL "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-cpp-runtime-bindings-ssd.tar.gz"
+    CACHE STRING "URL to download SVS C++ runtime bindings tarball (used when svs_runtime_DIR is not set)")
 
 if(FAISS_ENABLE_GPU)
   if(FAISS_ENABLE_ROCM)

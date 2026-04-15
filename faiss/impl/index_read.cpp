@@ -2267,6 +2267,7 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
             FAISS_THROW_IF_NOT_MSG(
                     leanvec, "dynamic_cast to IndexSVSVamanaLeanVec failed");
             READ1(leanvec->leanvec_d);
+            READ1(leanvec->primary_only);
         }
 
         bool initialized;

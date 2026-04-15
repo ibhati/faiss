@@ -1028,6 +1028,7 @@ void write_index(const Index* idx, IOWriter* f, int io_flags) {
 
         if (lean != nullptr) {
             WRITE1(lean->leanvec_d);
+            WRITE1(lean->primary_only);
         }
 
         bool initialized = (svs->impl != nullptr);

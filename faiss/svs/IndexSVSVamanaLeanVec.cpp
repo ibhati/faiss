@@ -44,10 +44,12 @@ IndexSVSVamanaLeanVec::IndexSVSVamanaLeanVec(
         size_t degree,
         MetricType metric,
         size_t leanvec_dims,
-        SVSStorageKind storage_kind)
+        SVSStorageKind storage_kind,
+        bool primary_only)
         : IndexSVSVamana(d, degree, metric, storage_kind) {
     is_trained = false;
     leanvec_d = leanvec_dims == 0 ? d / 2 : leanvec_dims;
+    this->primary_only = primary_only;
 }
 
 IndexSVSVamanaLeanVec::~IndexSVSVamanaLeanVec() {
@@ -120,6 +122,17 @@ void IndexSVSVamanaLeanVec::deserialize_training_data(std::istream& in) {
     training_data = tdata;
 }
 
+void IndexSVSVamanaLeanVec::deserialize_impl(std::istream& in) {
+    FAISS_THROW_IF_MSG(impl, "Cannot deserialize: SVS index already loaded.");
+    auto svs_metric = to_svs_metric(metric_type);
+    auto svs_storage_kind = to_svs_storage_kind(storage_kind);
+    auto status =
+            impl->load(&impl, in, svs_metric, svs_storage_kind, primary_only);
+    if (!status.ok()) {
+        FAISS_THROW_MSG(status.message());
+    }
+}
+
 void IndexSVSVamanaLeanVec::create_impl() {
     ntotal = 0;
     auto svs_metric = to_svs_metric(metric_type);
@@ -137,6 +150,7 @@ void IndexSVSVamanaLeanVec::create_impl() {
             .search_buffer_capacity = search_buffer_capacity,
     };
     auto status = svs_runtime::Status_Ok;
+    svs_runtime::VamanaIndex::DynamicIndexParams dynamic_index_params{};
     if (training_data) {
         status = svs_runtime::DynamicVamanaIndexLeanVec::build(
                 &impl,
@@ -145,7 +159,9 @@ void IndexSVSVamanaLeanVec::create_impl() {
                 svs_storage_kind,
                 training_data,
                 build_params,
-                search_params);
+                search_params,
+                dynamic_index_params,
+                primary_only);
     } else {
         status = svs_runtime::DynamicVamanaIndexLeanVec::build(
                 &impl,
@@ -154,7 +170,9 @@ void IndexSVSVamanaLeanVec::create_impl() {
                 svs_storage_kind,
                 leanvec_d,
                 build_params,
-                search_params);
+                search_params,
+                dynamic_index_params,
+                primary_only);
     }
 
     if (!status.ok()) {

@@ -95,6 +95,19 @@ include(../cmake/link_to_faiss_lib.cmake)
 
 link_to_faiss_lib(faiss_test)
 
+# SVS SSD benchmark
+if(FAISS_ENABLE_SVS)
+  add_executable(bench_faiss_leanvec bench_faiss_leanvec.cpp)
+  target_compile_definitions(bench_faiss_leanvec PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
+  target_compile_features(bench_faiss_leanvec PRIVATE cxx_std_20)
+  link_to_faiss_lib(bench_faiss_leanvec)
+
+  add_executable(bench_faiss_leanvec_dynamic bench_faiss_leanvec_dynamic.cpp)
+  target_compile_definitions(bench_faiss_leanvec_dynamic PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
+  target_compile_features(bench_faiss_leanvec_dynamic PRIVATE cxx_std_20)
+  link_to_faiss_lib(bench_faiss_leanvec_dynamic)
+endif()
+
 if (FAISS_ENABLE_PYTHON)
   target_link_libraries(faiss_test PUBLIC faiss_example_external_module)
 endif()
