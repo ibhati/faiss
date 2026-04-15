@@ -101,6 +101,11 @@ if(FAISS_ENABLE_SVS)
   target_compile_definitions(bench_faiss_leanvec PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
   target_compile_features(bench_faiss_leanvec PRIVATE cxx_std_20)
   link_to_faiss_lib(bench_faiss_leanvec)
+
+  add_executable(bench_faiss_leanvec_dynamic bench_faiss_leanvec_dynamic.cpp)
+  target_compile_definitions(bench_faiss_leanvec_dynamic PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
+  target_compile_features(bench_faiss_leanvec_dynamic PRIVATE cxx_std_20)
+  link_to_faiss_lib(bench_faiss_leanvec_dynamic)
 endif()
 
 if (FAISS_ENABLE_PYTHON)

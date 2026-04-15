@@ -8,9 +8,7 @@
  *   make -j bench_faiss_leanvec
  *
  * Run:
- *   sudo LD_LIBRARY_PATH=/raid6/ishwarsi/projects/svs_ssd/install/lib \
- *       taskset -c 56 numactl -m 1 \
- *       ./tests/bench_faiss_leanvec [SW] [BS] [reps] [index_dir] [ram]
+ *   ./tests/bench_faiss_leanvec [SW] [BS] [reps] [index_dir] [mode]
  */
 
 #include <faiss/svs/IndexSVSVamanaSSD.h>
@@ -187,9 +185,9 @@ struct Config {
 // Main
 // ----------------------------------------------------------------
 int main(int argc, char** argv) {
-    const char* query_file = "/export/data/ishwarsi/gist/gist_queries.fvecs";
-    const char* gt_file    = "/export/data/ishwarsi/gist/gist_gtruth.ivecs";
-    const char* index_dir  = (argc > 4) ? argv[4] : "/mnt/ishwarsi/svs_leanvec_bench/saved_index";
+    const char* query_file = "/path/to/gist/gist_queries.fvecs";
+    const char* gt_file    = "/path/to/gist/gist_gtruth.ivecs";
+    const char* index_dir  = (argc > 4) ? argv[4] : "/path/to/saved_index";
     const char* ssd_prefix = "/mnt";
 
     const int d = 960, k = 10, gt_k = 100;
@@ -199,7 +197,6 @@ int main(int argc, char** argv) {
     size_t num_reps      = (argc > 3) ? std::stoul(argv[3]) : 3;
     std::string mode     = (argc > 5) ? argv[5] : "all";
     bool ram_only        = (mode == "ram");
-    bool pri_only        = (mode == "primary_only");
 
     printf("=== Faiss LeanVec4x8 Benchmark ===\n");
     printf("Index:   %s\n", index_dir);
@@ -217,21 +214,6 @@ int main(int argc, char** argv) {
     if (batch_size == 0) batch_size = nq;
     size_t num_batches = (nq + batch_size - 1) / batch_size;
 
-    Config all_configs[] = {
-        {"RAM_RAM",   faiss::SVS_PLACEMENT_RAM, faiss::SVS_PLACEMENT_RAM, "",         false},
-        {"RAM_SSD",   faiss::SVS_PLACEMENT_RAM, faiss::SVS_PLACEMENT_SSD, ssd_prefix, false},
-        {"SSD_SSD",   faiss::SVS_PLACEMENT_SSD, faiss::SVS_PLACEMENT_SSD, ssd_prefix, false},
-        {"PRI_ONLY",  faiss::SVS_PLACEMENT_RAM, faiss::SVS_PLACEMENT_RAM, "",         true},
-    };
-    size_t config_start = 0;
-    size_t num_configs = 4;
-    if (ram_only) {
-        num_configs = 1;
-    } else if (pri_only) {
-        config_start = 3;
-        num_configs = 4;
-    }
-
     // Print header
     printf("%-10s | %7s | %7s | %9s %9s %9s %9s %9s | %8s %8s | %s\n",
            "Config", "Recall", "QPS",
@@ -241,43 +223,16 @@ int main(int argc, char** argv) {
            "---------------------------------------------"
            "-----------------------------\n");
 
-    for (size_t ci = config_start; ci < num_configs; ci++) {
-        auto& cfg = all_configs[ci];
-
-        drop_caches();
-
-        // Load index via faiss wrapper
-        faiss::IndexSVSVamanaSSD* index = nullptr;
-        try {
-            index = new faiss::IndexSVSVamanaSSD(
-                    d, faiss::METRIC_L2, faiss::SVS_LeanVec4x8,
-                    index_dir, cfg.ssd_path,
-                    cfg.primary, cfg.secondary,
-                    search_window, search_window,
-                    cfg.primary_only);
-        } catch (const std::exception& e) {
-            printf("%-10s | ERROR: %s\n", cfg.name, e.what());
-            continue;
-        }
-
+    // Lambda: run search benchmark on a generic faiss::Index
+    auto run_bench = [&](const char* name, faiss::Index* index,
+                         const faiss::SearchParameters* sp, bool cold) {
         auto mem_loaded = MemStats::read();
 
-        // Search params
-        faiss::SearchParametersSVSVamanaSSD sp;
-        sp.search_window_size = search_window;
-        sp.search_buffer_capacity = search_window;
-
-        // Output buffers
         std::vector<float> dists(nq * k);
         std::vector<faiss::idx_t> labels(nq * k);
-
-        // Search reps with per-batch latency
         std::vector<double> qps_values;
         std::vector<double> batch_latencies;
         long total_major = 0;
-
-        bool cold = (cfg.primary == faiss::SVS_PLACEMENT_SSD ||
-                     cfg.secondary == faiss::SVS_PLACEMENT_SSD);
 
         for (size_t rep = 0; rep < num_reps; rep++) {
             if (cold) drop_caches();
@@ -294,7 +249,7 @@ int main(int argc, char** argv) {
                 index->search(
                     bn, queries.data() + start * d, k,
                     dists.data() + start * k,
-                    labels.data() + start * k, &sp);
+                    labels.data() + start * k, sp);
                 auto t1 = std::chrono::high_resolution_clock::now();
                 double dt = std::chrono::duration<double>(t1 - t0).count();
                 total_time += dt;
@@ -304,17 +259,11 @@ int main(int argc, char** argv) {
             auto pf1 = PFStats::read();
             auto pf_d = pf1.delta(pf0);
             total_major += pf_d.major;
-
             qps_values.push_back(nq / total_time);
         }
 
-        // Recall (from last rep)
         double rec = recall_at_k(gt, labels, nq, gt_k, k, k);
-
-        // QPS stats
         double qps_max = *std::max_element(qps_values.begin(), qps_values.end());
-
-        // Latency percentiles
         std::sort(batch_latencies.begin(), batch_latencies.end());
         double lat_avg = std::accumulate(batch_latencies.begin(), batch_latencies.end(), 0.0)
                          / batch_latencies.size();
@@ -322,18 +271,56 @@ int main(int argc, char** argv) {
         double lat_p95 = percentile(batch_latencies, 95);
         double lat_p99 = percentile(batch_latencies, 99);
         double lat_max = batch_latencies.empty() ? 0 : batch_latencies.back();
-
         auto mem_final = MemStats::read();
 
         printf("%-10s | %.4f | %7.0f | %9.3f %9.3f %9.3f %9.3f %9.3f | %6.0fMB %6.0fMB | %ld\n",
-               cfg.name, rec, qps_max,
+               name, rec, qps_max,
                lat_avg * 1000, lat_p50 * 1000, lat_p95 * 1000,
                lat_p99 * 1000, lat_max * 1000,
                mem_loaded.rss_anon_kb / 1024.0,
                mem_final.rss_file_kb / 1024.0,
                total_major);
-
         fflush(stdout);
+    };
+
+    // ---- SSD index modes (IndexSVSVamanaSSD) ----
+    Config all_configs[] = {
+        {"RAM_RAM",   faiss::SVS_PLACEMENT_RAM, faiss::SVS_PLACEMENT_RAM, "",         false},
+        {"RAM_SSD",   faiss::SVS_PLACEMENT_RAM, faiss::SVS_PLACEMENT_SSD, ssd_prefix, false},
+        {"SSD_SSD",   faiss::SVS_PLACEMENT_SSD, faiss::SVS_PLACEMENT_SSD, ssd_prefix, false},
+    };
+    size_t config_start = 0;
+    size_t num_configs = 3;
+    if (ram_only) {
+        num_configs = 1;
+    }
+
+    for (size_t ci = config_start; ci < num_configs; ci++) {
+        auto& cfg = all_configs[ci];
+
+        drop_caches();
+
+        faiss::IndexSVSVamanaSSD* index = nullptr;
+        try {
+            index = new faiss::IndexSVSVamanaSSD(
+                    d, faiss::METRIC_L2, faiss::SVS_LeanVec4x8,
+                    index_dir, cfg.ssd_path,
+                    cfg.primary, cfg.secondary,
+                    search_window, search_window,
+                    cfg.primary_only);
+        } catch (const std::exception& e) {
+            printf("%-10s | ERROR: %s\n", cfg.name, e.what());
+            continue;
+        }
+
+        faiss::SearchParametersSVSVamanaSSD sp;
+        sp.search_window_size = search_window;
+        sp.search_buffer_capacity = search_window;
+
+        bool cold = (cfg.primary == faiss::SVS_PLACEMENT_SSD ||
+                     cfg.secondary == faiss::SVS_PLACEMENT_SSD);
+
+        run_bench(cfg.name, index, &sp, cold);
         delete index;
     }
 
