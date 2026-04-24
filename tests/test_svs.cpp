@@ -33,9 +33,9 @@
 #include <faiss/svs/IndexSVSVamanaLVQ.h>
 #include <faiss/svs/IndexSVSVamanaLeanVec.h>
 #include <faiss/svs/IndexSVSVamanaSSD.h>
+#include <gtest/gtest.h>
 #include <svs/runtime/training.h>
 #include <svs/runtime/vamana_index.h>
-#include <gtest/gtest.h>
 #include <filesystem>
 #include <random>
 #include <type_traits>
@@ -779,8 +779,12 @@ TEST_F(SVS, IVFSearchWithIDSelector) {
     std::vector<float> distances(nq * k);
     std::vector<faiss::idx_t> labels(nq * k);
 
-    // IVF search does not support IDSelector via the SVS runtime,
-    // so we just test that search works without crashing
+    // The current SVS runtime IVFIndex::search() API does not accept an
+    // IDFilter parameter (unlike VamanaIndex::search()), so the IDSelector
+    // passed via SearchParameters is silently ignored. This test verifies
+    // that search still works (without filtering). Once the SVS runtime
+    // exposes IDFilter support for IVF search, this can be wired up the
+    // same way Vamana uses make_faiss_id_filter().
     ASSERT_NO_THROW(index.search(nq, xq, k, distances.data(), labels.data()));
 }
 
@@ -927,14 +931,14 @@ TEST_F(SVS, IVFIntraQueryThreadsSetBeforeTrain) {
     const int k = 5;
     std::vector<float> distances(nq * k);
     std::vector<faiss::idx_t> labels(nq * k);
-    ASSERT_NO_THROW(
-            index.search(nq, test_data.data(), k, distances.data(), labels.data()));
+    ASSERT_NO_THROW(index.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
 
     // Changing intra_query_threads AFTER train() has no effect — this is a
     // known limitation of the current SVS runtime API.
     index.intra_query_threads = 4;
-    ASSERT_NO_THROW(
-            index.search(nq, test_data.data(), k, distances.data(), labels.data()));
+    ASSERT_NO_THROW(index.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
 }
 
 // --- IndexSVSVamanaSSD Tests ---
@@ -986,7 +990,8 @@ std::string prepare_ssd_index_dir_leanvec(
         faiss::SVSStorageKind storage,
         size_t leanvec_dims) {
     // LeanVec requires training, so we use the FAISS wrapper which handles it.
-    faiss::IndexSVSVamanaLeanVec builder{d, 64ul, metric, leanvec_dims, storage};
+    faiss::IndexSVSVamanaLeanVec builder{
+            d, 64ul, metric, leanvec_dims, storage};
     builder.train(n, data);
     builder.add(n, data);
 
@@ -1099,9 +1104,9 @@ TEST_F(SVSLL, SSDIndex_LVQ4x8_SSD_BOTH) {
             faiss::METRIC_L2,
             faiss::SVS_LVQ4x8,
             dir.c_str(),
-            "/tmp",                       // ssd_path
-            faiss::SVS_PLACEMENT_SSD,     // primary
-            faiss::SVS_PLACEMENT_SSD};    // secondary
+            "/tmp",                    // ssd_path
+            faiss::SVS_PLACEMENT_SSD,  // primary
+            faiss::SVS_PLACEMENT_SSD}; // secondary
     ASSERT_NE(ssd_idx.impl, nullptr);
 
     constexpr int nq = 5;
@@ -1114,12 +1119,7 @@ TEST_F(SVSLL, SSDIndex_LVQ4x8_SSD_BOTH) {
 
 TEST_F(SVSLL, SSDIndex_LeanVec4x4_RAM) {
     auto dir = prepare_ssd_index_dir_leanvec(
-            d,
-            n,
-            test_data.data(),
-            faiss::METRIC_L2,
-            faiss::SVS_LeanVec4x4,
-            0);
+            d, n, test_data.data(), faiss::METRIC_L2, faiss::SVS_LeanVec4x4, 0);
 
     faiss::IndexSVSVamanaSSD ssd_idx{
             d, faiss::METRIC_L2, faiss::SVS_LeanVec4x4, dir.c_str()};
@@ -1135,12 +1135,7 @@ TEST_F(SVSLL, SSDIndex_LeanVec4x4_RAM) {
 
 TEST_F(SVSLL, SSDIndex_LeanVec4x4_SSD_BOTH) {
     auto dir = prepare_ssd_index_dir_leanvec(
-            d,
-            n,
-            test_data.data(),
-            faiss::METRIC_L2,
-            faiss::SVS_LeanVec4x4,
-            0);
+            d, n, test_data.data(), faiss::METRIC_L2, faiss::SVS_LeanVec4x4, 0);
 
     faiss::IndexSVSVamanaSSD ssd_idx{
             d,
@@ -1162,12 +1157,7 @@ TEST_F(SVSLL, SSDIndex_LeanVec4x4_SSD_BOTH) {
 
 TEST_F(SVSLL, SSDIndex_LeanVec4x4_PrimaryOnly) {
     auto dir = prepare_ssd_index_dir_leanvec(
-            d,
-            n,
-            test_data.data(),
-            faiss::METRIC_L2,
-            faiss::SVS_LeanVec4x4,
-            0);
+            d, n, test_data.data(), faiss::METRIC_L2, faiss::SVS_LeanVec4x4, 0);
 
     // Load as primary-only — skips secondary data, no reranking
     faiss::IndexSVSVamanaSSD ssd_idx{
@@ -1175,11 +1165,11 @@ TEST_F(SVSLL, SSDIndex_LeanVec4x4_PrimaryOnly) {
             faiss::METRIC_L2,
             faiss::SVS_LeanVec4x4,
             dir.c_str(),
-            "",                           // no SSD path
-            faiss::SVS_PLACEMENT_RAM,     // primary
-            faiss::SVS_PLACEMENT_RAM,     // secondary (ignored)
-            10,                           // search_window
-            10,                           // search_buffer
+            "",                       // no SSD path
+            faiss::SVS_PLACEMENT_RAM, // primary
+            faiss::SVS_PLACEMENT_RAM, // secondary (ignored)
+            10,                       // search_window
+            10,                       // search_buffer
             /*primary_only=*/true};
     ASSERT_NE(ssd_idx.impl, nullptr);
     EXPECT_TRUE(ssd_idx.primary_only);
@@ -1208,8 +1198,7 @@ TEST_F(SVS, SSDIndex_RangeSearch) {
             50}; // search_buffer
 
     faiss::RangeSearchResult result(5);
-    ASSERT_NO_THROW(
-            ssd_idx.range_search(5, test_data.data(), 5.0f, &result));
+    ASSERT_NO_THROW(ssd_idx.range_search(5, test_data.data(), 5.0f, &result));
 }
 
 TEST_F(SVS, SSDIndex_CustomSearchParams) {
