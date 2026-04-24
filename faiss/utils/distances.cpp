@@ -551,7 +551,7 @@ struct Run_search_inner_product {
            size_t nx,
            size_t ny) {
         if (res.sel ||
-            nx < static_cast<size_t>(distance_compute_blas_threshold)) {
+            nx * d < static_cast<size_t>(distance_compute_blas_threshold)) {
             exhaustive_inner_product_seq(x, y, d, nx, ny, res);
         } else {
             exhaustive_inner_product_blas(x, y, d, nx, ny, res);
@@ -570,7 +570,7 @@ struct Run_search_L2sqr {
            size_t ny,
            const float* y_norm2) {
         if (res.sel ||
-            nx < static_cast<size_t>(distance_compute_blas_threshold)) {
+            nx * d < static_cast<size_t>(distance_compute_blas_threshold)) {
             exhaustive_L2sqr_seq(x, y, d, nx, ny, res);
         } else {
             exhaustive_L2sqr_blas(x, y, d, nx, ny, res, y_norm2);
@@ -584,7 +584,7 @@ struct Run_search_L2sqr {
  * KNN driver functions
  *******************************************************/
 
-int distance_compute_blas_threshold = 20;
+int distance_compute_blas_threshold = 128000;
 int distance_compute_blas_query_bs = 4096;
 int distance_compute_blas_database_bs = 1024;
 int distance_compute_min_k_reservoir = 100;
@@ -838,16 +838,16 @@ void knn_inner_products_by_idx(
         ld_ids = ny;
     }
 
+    with_simd_level([&]<SIMDLevel SL>() {
 #pragma omp parallel for if (nx > 100)
-    for (int64_t i = 0; i < static_cast<int64_t>(nx); i++) {
-        const float* x_ = x + i * d;
-        const int64_t* idsi = ids + i * ld_ids;
-        size_t j;
-        float* __restrict simi = res_vals + i * k;
-        int64_t* __restrict idxi = res_ids + i * k;
-        minheap_heapify(k, simi, idxi);
+        for (int64_t i = 0; i < static_cast<int64_t>(nx); i++) {
+            const float* x_ = x + i * d;
+            const int64_t* idsi = ids + i * ld_ids;
+            size_t j;
+            float* __restrict simi = res_vals + i * k;
+            int64_t* __restrict idxi = res_ids + i * k;
+            minheap_heapify(k, simi, idxi);
 
-        with_simd_level([&]<SIMDLevel SL>() {
             for (j = 0; j < nsubset; j++) {
                 if (idsi[j] < 0 || static_cast<size_t>(idsi[j]) >= ny) {
                     break;
@@ -858,9 +858,9 @@ void knn_inner_products_by_idx(
                     minheap_replace_top(k, simi, idxi, ip, idsi[j]);
                 }
             }
-        });
-        minheap_reorder(k, simi, idxi);
-    }
+            minheap_reorder(k, simi, idxi);
+        }
+    });
 }
 
 void knn_L2sqr_by_idx(
@@ -878,14 +878,14 @@ void knn_L2sqr_by_idx(
     if (ld_ids < 0) {
         ld_ids = ny;
     }
+    with_simd_level([&]<SIMDLevel SL>() {
 #pragma omp parallel for if (nx > 100)
-    for (int64_t i = 0; i < static_cast<int64_t>(nx); i++) {
-        const float* x_ = x + i * d;
-        const int64_t* __restrict idsi = ids + i * ld_ids;
-        float* __restrict simi = res_vals + i * k;
-        int64_t* __restrict idxi = res_ids + i * k;
-        maxheap_heapify(k, simi, idxi);
-        with_simd_level([&]<SIMDLevel SL>() {
+        for (int64_t i = 0; i < static_cast<int64_t>(nx); i++) {
+            const float* x_ = x + i * d;
+            const int64_t* __restrict idsi = ids + i * ld_ids;
+            float* __restrict simi = res_vals + i * k;
+            int64_t* __restrict idxi = res_ids + i * k;
+            maxheap_heapify(k, simi, idxi);
             for (size_t j = 0; j < nsubset; j++) {
                 if (idsi[j] < 0 || static_cast<size_t>(idsi[j]) >= ny) {
                     break;
@@ -896,9 +896,9 @@ void knn_L2sqr_by_idx(
                     maxheap_replace_top(k, simi, idxi, disij, idsi[j]);
                 }
             }
-        });
-        maxheap_reorder(k, simi, idxi);
-    }
+            maxheap_reorder(k, simi, idxi);
+        }
+    });
 }
 
 void pairwise_L2sqr(

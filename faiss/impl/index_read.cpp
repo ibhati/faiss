@@ -11,6 +11,7 @@
 #include <faiss/impl/io_macros.h>
 
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -423,6 +424,14 @@ std::unique_ptr<VectorTransform> read_VectorTransform_up(IOReader* f) {
                 (int)rdt->map.size(),
                 rdt->d_out);
     }
+    if (h == fourcc("VNrm")) {
+        FAISS_THROW_IF_NOT_FMT(
+                vt->d_in == vt->d_out,
+                "NormalizationTransform requires d_in == d_out, "
+                "got d_in=%d d_out=%d",
+                vt->d_in,
+                vt->d_out);
+    }
     if (h == fourcc("VCnt")) {
         auto* ct = dynamic_cast<CenteringTransform*>(vt.get());
         FAISS_THROW_IF_NOT_MSG(ct, "dynamic_cast to CenteringTransform failed");
@@ -431,6 +440,12 @@ std::unique_ptr<VectorTransform> read_VectorTransform_up(IOReader* f) {
                 "CenteringTransform mean size %d < d_in %d",
                 (int)ct->mean.size(),
                 ct->d_in);
+        FAISS_THROW_IF_NOT_FMT(
+                vt->d_in == vt->d_out,
+                "CenteringTransform requires d_in == d_out, "
+                "got d_in=%d d_out=%d",
+                vt->d_in,
+                vt->d_out);
     }
     if (h == fourcc("Viqt")) {
         auto* itqt = dynamic_cast<ITQTransform*>(vt.get());
@@ -498,18 +513,99 @@ std::unique_ptr<InvertedLists> read_InvertedLists_up(
         READ1(n_levels);
         FAISS_THROW_IF_NOT_FMT(
                 n_levels > 0, "invalid ilpn n_levels %zd", n_levels);
+        constexpr size_t bs = Panorama::kDefaultBatchSize;
         auto ailp = std::make_unique<ArrayInvertedListsPanorama>(
-                nlist, code_size, n_levels);
+                nlist, code_size, n_levels, bs);
         std::vector<size_t> sizes(nlist);
         read_ArrayInvertedLists_sizes(f, sizes);
+        size_t byte_limit = get_deserialization_vector_byte_limit();
         for (size_t i = 0; i < nlist; i++) {
+            FAISS_THROW_IF_NOT_FMT(
+                    sizes[i] <= byte_limit / sizeof(idx_t),
+                    "inverted list %zu ids size %zu exceeds "
+                    "deserialization byte limit",
+                    i,
+                    sizes[i]);
             ailp->ids[i].resize(sizes[i]);
-            size_t num_elems =
-                    ((sizes[i] + ArrayInvertedListsPanorama::kBatchSize - 1) /
-                     ArrayInvertedListsPanorama::kBatchSize) *
-                    ArrayInvertedListsPanorama::kBatchSize;
-            ailp->codes[i].resize(num_elems * code_size);
-            ailp->cum_sums[i].resize(num_elems * (n_levels + 1));
+            size_t num_elems = ((sizes[i] + bs - 1) / bs) * bs;
+            size_t codes_bytes = mul_no_overflow(
+                    num_elems, code_size, "inverted list codes");
+            FAISS_THROW_IF_NOT_FMT(
+                    codes_bytes <= byte_limit,
+                    "inverted list %zu codes size %zu exceeds "
+                    "deserialization byte limit",
+                    i,
+                    codes_bytes);
+            ailp->codes[i].resize(codes_bytes);
+            size_t cum_sums_count = mul_no_overflow(
+                    num_elems,
+                    add_no_overflow(
+                            n_levels, 1, "inverted list cum_sums n_levels"),
+                    "inverted list cum_sums");
+            FAISS_THROW_IF_NOT_FMT(
+                    cum_sums_count <= byte_limit / sizeof(ailp->cum_sums[0][0]),
+                    "inverted list %zu cum_sums size %zu exceeds "
+                    "deserialization byte limit",
+                    i,
+                    cum_sums_count);
+            ailp->cum_sums[i].resize(cum_sums_count);
+        }
+        for (size_t i = 0; i < nlist; i++) {
+            size_t n = sizes[i];
+            if (n > 0) {
+                read_vector_with_known_size(
+                        ailp->codes[i], f, ailp->codes[i].size());
+                read_vector_with_known_size(ailp->ids[i], f, n);
+                read_vector_with_known_size(
+                        ailp->cum_sums[i], f, ailp->cum_sums[i].size());
+            }
+        }
+        return ailp;
+    } else if (h == fourcc("ilp2") && !(io_flags & IO_FLAG_SKIP_IVF_DATA)) {
+        size_t nlist, code_size, n_levels, bs;
+        READ1(nlist);
+        FAISS_CHECK_DESERIALIZATION_LOOP_LIMIT(nlist, "ilp2 nlist");
+        READ1(code_size);
+        READ1(n_levels);
+        READ1(bs);
+        FAISS_THROW_IF_NOT_FMT(
+                n_levels > 0, "invalid ilp2 n_levels %zd", n_levels);
+        FAISS_THROW_IF_NOT_FMT(bs > 0, "invalid ilp2 batch_size %zd", bs);
+        auto ailp = std::make_unique<ArrayInvertedListsPanorama>(
+                nlist, code_size, n_levels, bs);
+        std::vector<size_t> sizes(nlist);
+        read_ArrayInvertedLists_sizes(f, sizes);
+        size_t byte_limit = get_deserialization_vector_byte_limit();
+        for (size_t i = 0; i < nlist; i++) {
+            FAISS_THROW_IF_NOT_FMT(
+                    sizes[i] <= byte_limit / sizeof(idx_t),
+                    "inverted list %zu ids size %zu exceeds "
+                    "deserialization byte limit",
+                    i,
+                    sizes[i]);
+            ailp->ids[i].resize(sizes[i]);
+            size_t num_elems = ((sizes[i] + bs - 1) / bs) * bs;
+            size_t codes_bytes = mul_no_overflow(
+                    num_elems, code_size, "inverted list codes");
+            FAISS_THROW_IF_NOT_FMT(
+                    codes_bytes <= byte_limit,
+                    "inverted list %zu codes size %zu exceeds "
+                    "deserialization byte limit",
+                    i,
+                    codes_bytes);
+            ailp->codes[i].resize(codes_bytes);
+            size_t cum_sums_count = mul_no_overflow(
+                    num_elems,
+                    add_no_overflow(
+                            n_levels, 1, "inverted list cum_sums n_levels"),
+                    "inverted list cum_sums");
+            FAISS_THROW_IF_NOT_FMT(
+                    cum_sums_count <= byte_limit / sizeof(ailp->cum_sums[0][0]),
+                    "inverted list %zu cum_sums size %zu exceeds "
+                    "deserialization byte limit",
+                    i,
+                    cum_sums_count);
+            ailp->cum_sums[i].resize(cum_sums_count);
         }
         for (size_t i = 0; i < nlist; i++) {
             size_t n = sizes[i];
@@ -531,10 +627,24 @@ std::unique_ptr<InvertedLists> read_InvertedLists_up(
         ails->codes.resize(ails->nlist);
         std::vector<size_t> sizes(ails->nlist);
         read_ArrayInvertedLists_sizes(f, sizes);
+        size_t ilar_byte_limit = get_deserialization_vector_byte_limit();
         for (size_t i = 0; i < ails->nlist; i++) {
+            FAISS_THROW_IF_NOT_FMT(
+                    sizes[i] <= ilar_byte_limit / sizeof(idx_t),
+                    "inverted list %zu ids size %zu exceeds "
+                    "deserialization byte limit",
+                    i,
+                    sizes[i]);
             ails->ids[i].resize(sizes[i]);
-            ails->codes[i].resize(mul_no_overflow(
-                    sizes[i], ails->code_size, "inverted list codes"));
+            size_t codes_bytes = mul_no_overflow(
+                    sizes[i], ails->code_size, "inverted list codes");
+            FAISS_THROW_IF_NOT_FMT(
+                    codes_bytes <= ilar_byte_limit,
+                    "inverted list %zu codes size %zu exceeds "
+                    "deserialization byte limit",
+                    i,
+                    codes_bytes);
+            ails->codes[i].resize(codes_bytes);
         }
         for (size_t i = 0; i < ails->nlist; i++) {
             size_t n = ails->ids[i].size();
@@ -700,6 +810,54 @@ static void validate_codebooks_size(
             aq.total_codebook_size);
 }
 
+// Validate FastScan fields shared by all FastScan index types.
+// M, ksub, bbs must be positive; bbs must be 32-aligned; M2 must be
+// roundup(M, 2); and ksub * M / ksub * M2 must not overflow.
+static void validate_fastscan_fields(
+        size_t M,
+        size_t M2,
+        size_t ksub,
+        int bbs,
+        const char* index_type) {
+    FAISS_THROW_IF_NOT_FMT(
+            M > 0 && ksub > 0,
+            "%s: invalid quantizer state (M=%zd, ksub=%zd, must be > 0)",
+            index_type,
+            M,
+            ksub);
+    FAISS_THROW_IF_NOT_FMT(
+            bbs > 0 && bbs % 32 == 0,
+            "%s: invalid bbs=%d (must be > 0 and a multiple of 32)",
+            index_type,
+            bbs);
+    size_t expected_M2 = (M + 1) & ~static_cast<size_t>(1); // roundup(M, 2)
+    FAISS_THROW_IF_NOT_FMT(
+            M2 == expected_M2,
+            "%s: invalid M2=%zd (expected roundup(M=%zd, 2) = %zd)",
+            index_type,
+            M2,
+            M,
+            expected_M2);
+    mul_no_overflow(ksub, M, index_type);
+    mul_no_overflow(ksub, M2, index_type);
+}
+
+// Validate that the AdditiveQuantizer dimension matches the index header
+// dimension.  compute_LUT() treats codebooks as a (d, total_codebook_size)
+// matrix and query vectors are sized for idx_d, so a mismatch leads to
+// out-of-bounds reads.
+static void validate_aq_dimension_match(
+        const AdditiveQuantizer& aq,
+        int idx_d,
+        const char* index_type) {
+    FAISS_THROW_IF_NOT_FMT(
+            aq.d == static_cast<size_t>(idx_d),
+            "%s: AdditiveQuantizer d=%zd does not match index d=%d",
+            index_type,
+            aq.d,
+            idx_d);
+}
+
 static void read_ResidualQuantizer(
         ResidualQuantizer& rq,
         IOReader* f,
@@ -858,6 +1016,7 @@ void read_ScalarQuantizer(
             case ScalarQuantizer::QT_bf16:
             case ScalarQuantizer::QT_8bit_direct:
             case ScalarQuantizer::QT_8bit_direct_signed:
+            case ScalarQuantizer::QT_0bit:
             case ScalarQuantizer::QT_count:
                 expected = 0;
                 break;
@@ -1248,6 +1407,20 @@ static std::unique_ptr<IndexIVFPQ> read_ivfpq(
             read_ProductQuantizer(&ivfpqr->refine_pq, f);
             READVECTOR(ivfpqr->refine_codes);
             READ1(ivfpqr->k_factor);
+            // k_factor multiplies k to size search-time allocations
+            // (n * k * k_factor labels + distances).  Defaults are 1
+            // (IndexRefine) and 4 (IndexIVFPQR); AutoTune explores
+            // powers-of-two up to 64.  Cap at 1000 to leave ample
+            // headroom beyond any known usage while still blocking
+            // OOM from crafted files (same cap as beam_factor in
+            // ResidualCoarseQuantizer).
+            FAISS_THROW_IF_NOT_FMT(
+                    std::isfinite(ivfpqr->k_factor) &&
+                            ivfpqr->k_factor >= 1.0f &&
+                            ivfpqr->k_factor <= 1000.0f,
+                    "k_factor %.6g out of valid range [1, 1000]"
+                    " for IndexIVFPQR",
+                    ivfpqr->k_factor);
         }
     }
     return ivpq;
@@ -1362,11 +1535,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         } else {
             read_ResidualQuantizer(idxr->rq, f, io_flags);
         }
-        FAISS_THROW_IF_NOT_FMT(
-                idxr->rq.d == static_cast<size_t>(idxr->d),
-                "IndexResidualQuantizer d mismatch: rq.d=%zd vs idx.d=%d",
-                idxr->rq.d,
-                idxr->d);
+        validate_aq_dimension_match(
+                idxr->rq, idxr->d, "IndexResidualQuantizer");
         READ1(idxr->code_size);
         read_vector(idxr->codes, f);
         FAISS_THROW_IF_NOT(
@@ -1376,11 +1546,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         auto idxr = std::make_unique<IndexLocalSearchQuantizer>();
         read_index_header(*idxr, f);
         read_LocalSearchQuantizer(idxr->lsq, f);
-        FAISS_THROW_IF_NOT_FMT(
-                idxr->lsq.d == static_cast<size_t>(idxr->d),
-                "IndexLocalSearchQuantizer d mismatch: lsq.d=%zd vs idx.d=%d",
-                idxr->lsq.d,
-                idxr->d);
+        validate_aq_dimension_match(
+                idxr->lsq, idxr->d, "IndexLocalSearchQuantizer");
         READ1(idxr->code_size);
         read_vector(idxr->codes, f);
         FAISS_THROW_IF_NOT(
@@ -1390,11 +1557,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         auto idxpr = std::make_unique<IndexProductResidualQuantizer>();
         read_index_header(*idxpr, f);
         read_ProductResidualQuantizer(idxpr->prq, f, io_flags);
-        FAISS_THROW_IF_NOT_FMT(
-                idxpr->prq.d == static_cast<size_t>(idxpr->d),
-                "IndexProductResidualQuantizer d mismatch: prq.d=%zd vs idx.d=%d",
-                idxpr->prq.d,
-                idxpr->d);
+        validate_aq_dimension_match(
+                idxpr->prq, idxpr->d, "IndexProductResidualQuantizer");
         READ1(idxpr->code_size);
         read_vector(idxpr->codes, f);
         FAISS_THROW_IF_NOT(
@@ -1404,11 +1568,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         auto idxpl = std::make_unique<IndexProductLocalSearchQuantizer>();
         read_index_header(*idxpl, f);
         read_ProductLocalSearchQuantizer(idxpl->plsq, f);
-        FAISS_THROW_IF_NOT_FMT(
-                idxpl->plsq.d == static_cast<size_t>(idxpl->d),
-                "IndexProductLocalSearchQuantizer d mismatch: plsq.d=%zd vs idx.d=%d",
-                idxpl->plsq.d,
-                idxpl->d);
+        validate_aq_dimension_match(
+                idxpl->plsq, idxpl->d, "IndexProductLocalSearchQuantizer");
         READ1(idxpl->code_size);
         read_vector(idxpl->codes, f);
         FAISS_THROW_IF_NOT(
@@ -1418,11 +1579,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         auto idxr = std::make_unique<ResidualCoarseQuantizer>();
         read_index_header(*idxr, f);
         read_ResidualQuantizer(idxr->rq, f, io_flags);
-        FAISS_THROW_IF_NOT_FMT(
-                idxr->rq.d == static_cast<size_t>(idxr->d),
-                "ResidualCoarseQuantizer d mismatch: rq.d=%zd vs idx.d=%d",
-                idxr->rq.d,
-                idxr->d);
+        validate_aq_dimension_match(
+                idxr->rq, idxr->d, "ResidualCoarseQuantizer");
         READ1(idxr->beam_factor);
         if (io_flags & IO_FLAG_SKIP_PRECOMPUTE_TABLE) {
             // then we force the beam factor to -1
@@ -1493,6 +1651,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
             read_ProductResidualQuantizer(
                     *(ProductResidualQuantizer*)idxaqfs->aq, f, io_flags);
         }
+        validate_aq_dimension_match(
+                *idxaqfs->aq, idxaqfs->d, "IndexAdditiveQuantizerFastScan");
 
         READ1(idxaqfs->implem);
         READ1(idxaqfs->bbs);
@@ -1512,25 +1672,12 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
 
         READVECTOR(idxaqfs->codes);
 
-        FAISS_THROW_IF_NOT_FMT(
-                idxaqfs->M > 0 && idxaqfs->ksub > 0,
-                "IndexAdditiveQuantizerFastScan: invalid quantizer state "
-                "(M=%zd, ksub=%zd, must be > 0)",
+        validate_fastscan_fields(
                 idxaqfs->M,
-                idxaqfs->ksub);
-        FAISS_THROW_IF_NOT_FMT(
-                idxaqfs->bbs > 0 && idxaqfs->bbs % 32 == 0,
-                "IndexAdditiveQuantizerFastScan: invalid bbs=%d "
-                "(must be > 0 and a multiple of 32)",
-                idxaqfs->bbs);
-        mul_no_overflow(
-                idxaqfs->ksub,
-                idxaqfs->M,
-                "IndexAdditiveQuantizerFastScan ksub * M");
-        mul_no_overflow(
-                idxaqfs->ksub,
                 idxaqfs->M2,
-                "IndexAdditiveQuantizerFastScan ksub * M2");
+                idxaqfs->ksub,
+                idxaqfs->bbs,
+                "IndexAdditiveQuantizerFastScan");
 
         idx = std::move(idxaqfs);
     } else if (
@@ -1566,6 +1713,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
             read_ProductResidualQuantizer(
                     *(ProductResidualQuantizer*)ivaqfs->aq, f, io_flags);
         }
+        validate_aq_dimension_match(
+                *ivaqfs->aq, ivaqfs->d, "IndexIVFAdditiveQuantizerFastScan");
 
         READ1(ivaqfs->by_residual);
         READ1(ivaqfs->implem);
@@ -1586,6 +1735,14 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
 
         read_InvertedLists(*ivaqfs, f, io_flags);
         ivaqfs->init_code_packer();
+
+        validate_fastscan_fields(
+                ivaqfs->M,
+                ivaqfs->M2,
+                ivaqfs->ksub,
+                ivaqfs->bbs,
+                "IndexIVFAdditiveQuantizerFastScan");
+
         idx = std::move(ivaqfs);
     } else if (h == fourcc("IvFl") || h == fourcc("IvFL")) { // legacy
         auto ivfl = std::make_unique<IndexIVFFlat>();
@@ -1631,6 +1788,15 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         read_ivf_header(ivfp.get(), f);
         ivfp->code_size = ivfp->d * sizeof(float);
         READ1(ivfp->n_levels);
+        ivfp->batch_size = Panorama::kDefaultBatchSize;
+        read_InvertedLists(*ivfp, f, io_flags);
+        idx = std::move(ivfp);
+    } else if (h == fourcc("IwP2")) {
+        auto ivfp = std::make_unique<IndexIVFFlatPanorama>();
+        read_ivf_header(ivfp.get(), f);
+        ivfp->code_size = ivfp->d * sizeof(float);
+        READ1(ivfp->n_levels);
+        READ1(ivfp->batch_size);
         read_InvertedLists(*ivfp, f, io_flags);
         idx = std::move(ivfp);
     } else if (h == fourcc("IwFl")) {
@@ -1723,6 +1889,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
             read_ProductResidualQuantizer(
                     *(ProductResidualQuantizer*)iva->aq, f, io_flags);
         }
+        validate_aq_dimension_match(
+                *iva->aq, iva->d, "IndexIVFAdditiveQuantizer");
         READ1(iva->by_residual);
         READ1(iva->use_precomputed_table);
         read_InvertedLists(*iva, f, io_flags);
@@ -1794,6 +1962,36 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
             ixpt->chain.push_back(read_VectorTransform(f));
         }
         ixpt->index = read_index(f, io_flags);
+        // Validate transform chain dimension consistency:
+        // chain[0].d_in must equal the outer index d, consecutive
+        // transforms must have matching d_out/d_in, and the last
+        // transform's d_out must equal the sub-index d.
+        if (nt > 0) {
+            FAISS_THROW_IF_NOT_FMT(
+                    ixpt->chain[0]->d_in == ixpt->d,
+                    "IndexPreTransform chain[0] d_in=%d != index d=%d",
+                    ixpt->chain[0]->d_in,
+                    ixpt->d);
+            for (int i = 1; i < nt; i++) {
+                FAISS_THROW_IF_NOT_FMT(
+                        ixpt->chain[i]->d_in == ixpt->chain[i - 1]->d_out,
+                        "IndexPreTransform chain[%d] d_in=%d != "
+                        "chain[%d] d_out=%d",
+                        i,
+                        ixpt->chain[i]->d_in,
+                        i - 1,
+                        ixpt->chain[i - 1]->d_out);
+            }
+            if (ixpt->index) {
+                FAISS_THROW_IF_NOT_FMT(
+                        ixpt->chain[nt - 1]->d_out == ixpt->index->d,
+                        "IndexPreTransform chain[%d] d_out=%d "
+                        "!= sub-index d=%d",
+                        nt - 1,
+                        ixpt->chain[nt - 1]->d_out,
+                        ixpt->index->d);
+            }
+        }
         idx = std::move(ixpt);
     } else if (h == fourcc("Imiq")) {
         auto imiq = std::make_unique<MultiIndexQuantizer>();
@@ -1806,6 +2004,12 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         auto base = read_index_up(f, io_flags);
         auto refine = read_index_up(f, io_flags);
         READ1(idxrf->k_factor);
+        // Same rationale as IndexIVFPQR k_factor above.
+        FAISS_THROW_IF_NOT_FMT(
+                std::isfinite(idxrf->k_factor) && idxrf->k_factor >= 1.0f &&
+                        idxrf->k_factor <= 1000.0f,
+                "k_factor %.6g out of valid range [1, 1000] for IndexRefine",
+                idxrf->k_factor);
         if (h == fourcc("IxRP")) {
             // then make a RefineFlatPanorama with it
             auto idxrf_new = std::make_unique<IndexRefinePanorama>();
@@ -1831,6 +2035,12 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         idxmap->index = read_index(f, io_flags);
         idxmap->own_fields = true;
         READVECTOR(idxmap->id_map);
+        FAISS_THROW_IF_NOT_FMT(
+                idxmap->id_map.size() == idxmap->ntotal,
+                "IndexIDMap id_map size (%" PRId64
+                ") does not match ntotal (%" PRId64 ")",
+                int64_t(idxmap->id_map.size()),
+                idxmap->ntotal);
         if (is_map2) {
             static_cast<IndexIDMap2*>(idxmap.get())->construct_rev_map();
         }
@@ -1922,6 +2132,15 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
                     "HNSW storage d %d != index d %d",
                     idxhnsw->storage->d,
                     idxhnsw->d);
+        }
+        if (h == fourcc("IHN2")) {
+            FAISS_THROW_IF_NOT_MSG(
+                    idxhnsw->storage,
+                    "IndexHNSW2Level requires non-null storage");
+            FAISS_THROW_IF_NOT_MSG(
+                    dynamic_cast<Index2Layer*>(idxhnsw->storage) ||
+                            dynamic_cast<IndexIVFPQ*>(idxhnsw->storage),
+                    "IndexHNSW2Level storage must be Index2Layer or IndexIVFPQ");
         }
         if (h == fourcc("IHNp") && !(io_flags & IO_FLAG_PQ_SKIP_SDC_TABLE)) {
             auto* storage_pq = dynamic_cast<IndexPQ*>(idxhnsw->storage);
@@ -2022,20 +2241,12 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         idxpqfs->ksub = (1 << pq.nbits);
         idxpqfs->code_size = pq.code_size;
 
-        FAISS_THROW_IF_NOT_FMT(
-                idxpqfs->M > 0 && idxpqfs->ksub > 0,
-                "IndexPQFastScan: invalid quantizer state "
-                "(M=%zd, ksub=%zd, must be > 0)",
+        validate_fastscan_fields(
                 idxpqfs->M,
-                idxpqfs->ksub);
-        FAISS_THROW_IF_NOT_FMT(
-                idxpqfs->bbs > 0 && idxpqfs->bbs % 32 == 0,
-                "IndexPQFastScan: invalid bbs=%d "
-                "(must be > 0 and a multiple of 32)",
-                idxpqfs->bbs);
-        mul_no_overflow(idxpqfs->ksub, idxpqfs->M, "IndexPQFastScan ksub * M");
-        mul_no_overflow(
-                idxpqfs->ksub, idxpqfs->M2, "IndexPQFastScan ksub * M2");
+                idxpqfs->M2,
+                idxpqfs->ksub,
+                idxpqfs->bbs,
+                "IndexPQFastScan");
 
         idx = std::move(idxpqfs);
 
@@ -2058,6 +2269,9 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         ivpq->ksub = (1 << pq.nbits);
         ivpq->code_size = pq.code_size;
         ivpq->init_code_packer();
+
+        validate_fastscan_fields(
+                ivpq->M, ivpq->M2, ivpq->ksub, ivpq->bbs, "IndexIVFPQFastScan");
 
         idx = std::move(ivpq);
     } else if (h == fourcc("IRMf")) {
@@ -2107,21 +2321,12 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         idxqfs->nbits = nbits_fastscan;
         idxqfs->ksub = (1 << nbits_fastscan);
 
-        FAISS_THROW_IF_NOT_FMT(
-                idxqfs->M > 0 && idxqfs->ksub > 0,
-                "IndexRaBitQFastScan: invalid quantizer state "
-                "(M=%zd, ksub=%zd, must be > 0)",
+        validate_fastscan_fields(
                 idxqfs->M,
-                idxqfs->ksub);
-        FAISS_THROW_IF_NOT_FMT(
-                idxqfs->bbs > 0 && idxqfs->bbs % 32 == 0,
-                "IndexRaBitQFastScan: invalid bbs=%d "
-                "(must be > 0 and a multiple of 32)",
-                idxqfs->bbs);
-        mul_no_overflow(
-                idxqfs->ksub, idxqfs->M, "IndexRaBitQFastScan ksub * M");
-        mul_no_overflow(
-                idxqfs->ksub, idxqfs->M2, "IndexRaBitQFastScan ksub * M2");
+                idxqfs->M2,
+                idxqfs->ksub,
+                idxqfs->bbs,
+                "IndexRaBitQFastScan");
 
         READVECTOR(idxqfs->codes);
 
@@ -2248,7 +2453,16 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         READ1(svs->max_candidate_pool_size);
         READ1(svs->prune_to);
         READ1(svs->use_full_search_history);
-        READ1(svs->storage_kind);
+
+        int sk;
+        READ1(sk);
+        FAISS_THROW_IF_NOT_FMT(
+                sk >= 0 && sk < static_cast<int>(SVS_count),
+                "invalid SVS storage_kind=%d (must be in [0, %d))",
+                sk,
+                static_cast<int>(SVS_count));
+        svs->storage_kind = static_cast<SVSStorageKind>(sk);
+
         if (h == fourcc("ISVL")) {
             auto* leanvec = dynamic_cast<IndexSVSVamanaLeanVec*>(svs.get());
             FAISS_THROW_IF_NOT_MSG(
@@ -2260,7 +2474,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         bool initialized;
         READ1(initialized);
         if (initialized) {
-            faiss::svs_io::ReaderStreambuf rbuf(f);
+            faiss::svs_io::ReaderStreambuf rbuf(
+                    f, get_deserialization_vector_byte_limit());
             std::istream is(&rbuf);
             svs->deserialize_impl(is);
         }
@@ -2268,7 +2483,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
             bool trained;
             READ1(trained);
             if (trained) {
-                faiss::svs_io::ReaderStreambuf rbuf(f);
+                faiss::svs_io::ReaderStreambuf rbuf(
+                        f, get_deserialization_vector_byte_limit());
                 std::istream is(&rbuf);
                 auto* leanvec = dynamic_cast<IndexSVSVamanaLeanVec*>(svs.get());
                 FAISS_THROW_IF_NOT_MSG(
@@ -2285,7 +2501,8 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         bool initialized;
         READ1(initialized);
         if (initialized) {
-            faiss::svs_io::ReaderStreambuf rbuf(f);
+            faiss::svs_io::ReaderStreambuf rbuf(
+                    f, get_deserialization_vector_byte_limit());
             std::istream is(&rbuf);
             svs->deserialize_impl(is);
         }
@@ -2377,6 +2594,13 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         ivrqfs->M = M_fastscan;
         ivrqfs->nbits = nbits_fastscan;
         ivrqfs->ksub = (1 << nbits_fastscan);
+
+        validate_fastscan_fields(
+                ivrqfs->M,
+                ivrqfs->M2,
+                ivrqfs->ksub,
+                ivrqfs->bbs,
+                "IndexIVFRaBitQFastScan");
 
         read_InvertedLists(*ivrqfs, f, io_flags);
         ivrqfs->init_code_packer();

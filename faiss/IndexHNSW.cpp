@@ -28,12 +28,12 @@
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/ResultHandler.h>
 #include <faiss/impl/VisitedTable.h>
+#include <faiss/impl/hnsw/MinimaxHeap.h>
 #include <faiss/utils/random.h>
 #include <faiss/utils/sorting.h>
 
 namespace faiss {
 
-using MinimaxHeap = HNSW::MinimaxHeap;
 using storage_idx_t = HNSW::storage_idx_t;
 using NodeDistFarther = HNSW::NodeDistFarther;
 
@@ -82,10 +82,8 @@ void hnsw_add_vertices(
         printf("  max_level = %d\n", max_level);
     }
 
-    std::vector<omp_lock_t> locks(ntotal);
-    for (size_t i = 0; i < ntotal; i++) {
-        omp_init_lock(&locks[i]);
-    }
+    auto& locks = index_hnsw.locks;
+    locks.prepare(ntotal);
 
     // add vectors from highest to lowest level
     std::vector<int> hist;
@@ -95,7 +93,7 @@ void hnsw_add_vertices(
 
         // build histogram
         for (size_t i = 0; i < n; i++) {
-            storage_idx_t pt_id = i + n0;
+            storage_idx_t pt_id = static_cast<storage_idx_t>(i + n0);
             int pt_level = hnsw.levels[pt_id] - 1;
             while (pt_level >= static_cast<int>(hist.size())) {
                 hist.push_back(0);
@@ -111,7 +109,7 @@ void hnsw_add_vertices(
 
         // bucket sort
         for (size_t i = 0; i < n; i++) {
-            storage_idx_t pt_id = i + n0;
+            storage_idx_t pt_id = static_cast<storage_idx_t>(i + n0);
             int pt_level = hnsw.levels[pt_id] - 1;
             order[offsets[pt_level]++] = pt_id;
         }
@@ -123,20 +121,22 @@ void hnsw_add_vertices(
     { // perform add
         RandomGenerator rng2(789);
 
-        int i1 = n;
+        size_t i1 = static_cast<int>(n);
 
         for (int pt_level = static_cast<int>(hist.size()) - 1;
              pt_level >= int(!index_hnsw.init_level0);
              pt_level--) {
-            int i0 = i1 - hist[pt_level];
+            size_t i0 = i1 - hist[pt_level];
 
             if (verbose) {
-                printf("Adding %d elements at level %d\n", i1 - i0, pt_level);
+                printf("Adding %zu elements at level %d\n", i1 - i0, pt_level);
             }
 
             // random permutation to get rid of dataset order bias
-            for (int j = i0; j < i1; j++) {
-                std::swap(order[j], order[j + rng2.rand_int(i1 - j)]);
+            for (size_t j = i0; j < i1; j++) {
+                std::swap(
+                        order[j],
+                        order[j + rng2.rand_int(static_cast<int>(i1 - j))]);
             }
 
             bool interrupt = false;
@@ -147,15 +147,15 @@ void hnsw_add_vertices(
 
                 std::unique_ptr<DistanceComputer> dis(
                         storage_distance_computer(index_hnsw.storage));
-                int prev_display =
-                        verbose && omp_get_thread_num() == 0 ? 0 : -1;
+                bool do_display = verbose && omp_get_thread_num() == 0;
+                size_t prev_display = 0;
                 size_t counter = 0;
 
                 // here we should do schedule(dynamic) but this segfaults for
                 // some versions of LLVM. The performance impact should not be
                 // too large when (i1 - i0) / num_threads >> 1
 #pragma omp for schedule(static)
-                for (int i = i0; i < i1; i++) {
+                for (int64_t i = i0; i < i1; i++) {
                     storage_idx_t pt_id = order[i];
                     dis->set_query(x + (pt_id - n0) * d);
 
@@ -172,9 +172,9 @@ void hnsw_add_vertices(
                             vt,
                             index_hnsw.keep_max_size_level0 && (pt_level == 0));
 
-                    if (prev_display >= 0 && i - i0 > prev_display + 10000) {
+                    if (do_display && i - i0 > prev_display + 10000) {
                         prev_display = i - i0;
-                        printf("  %d / %d\r", i - i0, i1 - i0);
+                        printf("  %zu / %zu\r", i - i0, i1 - i0);
                         fflush(stdout);
                     }
                     if (counter % check_period == 0) {
@@ -199,9 +199,8 @@ void hnsw_add_vertices(
     if (verbose) {
         printf("Done in %.3f ms\n", getmillisecs() - t0);
     }
-
-    for (size_t i = 0; i < ntotal; i++) {
-        omp_destroy_lock(&locks[i]);
+    if (!index_hnsw.retain_locks) {
+        locks.clear();
     }
 }
 
@@ -285,6 +284,7 @@ void hnsw_search(
                 ndis += stats.ndis;
                 nhops += stats.nhops;
                 res.end();
+                vt.advance();
             }
         }
         InterruptCallback::check();
@@ -349,7 +349,7 @@ void IndexHNSW::add(idx_t n, const float* x) {
             storage,
             "Please use IndexHNSWFlat (or variants) instead of IndexHNSW directly");
     FAISS_THROW_IF_NOT(is_trained);
-    int n0 = ntotal;
+    size_t n0 = ntotal;
     storage->add(n, x);
     ntotal = storage->ntotal;
 
@@ -364,6 +364,7 @@ void IndexHNSW::add(idx_t n, const float* x) {
 
 void IndexHNSW::reset() {
     hnsw.reset();
+    locks.clear();
     storage->reset();
     ntotal = 0;
 }
@@ -435,7 +436,7 @@ void IndexHNSW::search_level_0(
     FAISS_THROW_IF_NOT(k > 0);
     FAISS_THROW_IF_NOT(nprobe > 0);
 
-    storage_idx_t hnsw_ntotal = hnsw.levels.size();
+    size_t hnsw_ntotal = hnsw.levels.size();
 
     using RH = HeapBlockResultHandler<HNSW::C>;
     RH bres(n, distances, labels, k);
@@ -496,7 +497,7 @@ void IndexHNSW::init_level_0_from_knngraph(
         std::priority_queue<NodeDistFarther> initial_list;
 
         for (int j = 0; j < k; j++) {
-            int v1 = I[i * k + j];
+            int v1 = static_cast<int>(I[i * k + j]);
             if (v1 == i) {
                 continue;
             }
@@ -526,10 +527,7 @@ void IndexHNSW::init_level_0_from_entry_points(
         int n,
         const storage_idx_t* points,
         const storage_idx_t* nearests) {
-    std::vector<omp_lock_t> locks(ntotal);
-    for (idx_t i = 0; i < ntotal; i++) {
-        omp_init_lock(&locks[i]);
-    }
+    locks.prepare(ntotal);
 
 #pragma omp parallel
     {
@@ -547,7 +545,7 @@ void IndexHNSW::init_level_0_from_entry_points(
             dis->set_query(vec.data());
 
             hnsw.add_links_starting_from(
-                    *dis, pt_id, nearest, (*dis)(nearest), 0, locks.data(), vt);
+                    *dis, pt_id, nearest, (*dis)(nearest), 0, locks, vt);
 
             if (verbose && i % 10000 == 0) {
                 printf("  %d / %d\r", i, n);
@@ -559,8 +557,8 @@ void IndexHNSW::init_level_0_from_entry_points(
         printf("\n");
     }
 
-    for (idx_t i = 0; i < ntotal; i++) {
-        omp_destroy_lock(&locks[i]);
+    if (!retain_locks) {
+        locks.clear();
     }
 }
 
@@ -863,8 +861,11 @@ void IndexHNSW2Level::search(
 
         const IndexIVFPQ* index_ivfpq =
                 dynamic_cast<const IndexIVFPQ*>(storage);
+        FAISS_THROW_IF_NOT_MSG(
+                index_ivfpq,
+                "IndexHNSW2Level mixed search requires IndexIVFPQ storage");
 
-        int nprobe = index_ivfpq->nprobe;
+        size_t nprobe = index_ivfpq->nprobe;
 
         std::unique_ptr<idx_t[]> coarse_assign(new idx_t[n * nprobe]);
         std::unique_ptr<float[]> coarse_dis(new float[n * nprobe]);
@@ -900,7 +901,7 @@ void IndexHNSW2Level::search(
 
                 // mark all inverted list elements as visited
 
-                for (int j = 0; j < nprobe; j++) {
+                for (size_t j = 0; j < nprobe; j++) {
                     idx_t key = coarse_assign[j + i * nprobe];
                     if (key < 0) {
                         break;
@@ -919,7 +920,8 @@ void IndexHNSW2Level::search(
                     if (idxi[j] < 0) {
                         break;
                     }
-                    candidates.push(idxi[j], simi[j]);
+                    candidates.push(
+                            static_cast<storage_idx_t>(idxi[j]), simi[j]);
                 }
 
                 // reorder from sorted to heap
@@ -929,14 +931,14 @@ void IndexHNSW2Level::search(
                 search_from_candidates_2(
                         hnsw,
                         *dis,
-                        k,
+                        static_cast<int>(k),
                         idxi,
                         simi,
                         candidates,
                         vt,
                         search_stats,
                         0,
-                        k);
+                        static_cast<int>(k));
                 n1 += search_stats.n1;
                 n2 += search_stats.n2;
                 ndis += search_stats.ndis;
@@ -1043,7 +1045,7 @@ void IndexHNSWCagra::search(
         std::vector<storage_idx_t> nearest(n);
         std::vector<float> nearest_d(n);
 
-#pragma omp for
+#pragma omp parallel for
         for (idx_t i = 0; i < n; i++) {
             std::unique_ptr<DistanceComputer> dis(
                     storage_distance_computer(this->storage));
@@ -1059,7 +1061,7 @@ void IndexHNSWCagra::search(
                 auto idx = distrib(gen);
                 auto distance = (*dis)(idx);
                 if (distance < nearest_d[i]) {
-                    nearest[i] = idx;
+                    nearest[i] = static_cast<storage_idx_t>(idx);
                     nearest_d[i] = distance;
                 }
             }
@@ -1078,6 +1080,70 @@ void IndexHNSWCagra::search(
                 1, // n_probes
                 1, // search_type
                 params);
+    }
+}
+
+void IndexHNSWCagra::range_search(
+        idx_t n,
+        const float* x,
+        float radius,
+        RangeSearchResult* result,
+        const SearchParameters* params) const {
+    if (!base_level_only) {
+        IndexHNSW::range_search(n, x, radius, result, params);
+        return;
+    }
+
+    const HNSW& hnsw = this->hnsw;
+    size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
+    float threshold = is_similarity_metric(metric_type) ? -radius : radius;
+    RangeSearchPartialResult pres(result);
+
+    for (idx_t i = 0; i < n; i++) {
+        std::unique_ptr<DistanceComputer> dis(
+                storage_distance_computer(storage));
+        dis->set_query(x + i * d);
+
+        storage_idx_t nearest = -1;
+        float nearest_d = std::numeric_limits<float>::max();
+
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<idx_t> distrib(0, ntotal - 1);
+
+        for (idx_t j = 0; j < num_base_level_search_entrypoints; j++) {
+            auto idx = distrib(gen);
+            auto distance = (*dis)(idx);
+            if (distance < nearest_d) {
+                nearest = idx;
+                nearest_d = distance;
+            }
+        }
+        FAISS_THROW_IF_NOT_MSG(
+                nearest >= 0, "Could not find a valid entrypoint.");
+
+        RangeQueryResult& qres = pres.new_result(i);
+        RangeResultHandler<HNSW::C> res(&qres, threshold);
+        VisitedTable vt(ntotal, hnsw.use_visited_hashset);
+        HNSWStats stats;
+        hnsw.search_level_0(
+                *dis, res, 1, &nearest, &nearest_d, 1, stats, vt, params);
+        n1 += stats.n1;
+        n2 += stats.n2;
+        ndis += stats.ndis;
+        nhops += stats.nhops;
+    }
+
+    pres.set_lims();
+    result->do_allocation();
+    pres.copy_result();
+
+    hnsw_stats.combine({n1, n2, ndis, nhops});
+
+    if (is_similarity_metric(metric_type)) {
+        for (size_t i = 0; i < result->lims[result->nq]; i++) {
+            result->distances[i] = -result->distances[i];
+        }
     }
 }
 

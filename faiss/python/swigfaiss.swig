@@ -121,6 +121,7 @@ typedef uint64_t size_t;
 #include <faiss/IndexShards.h>
 #include <faiss/IndexShardsIVF.h>
 #include <faiss/IndexReplicas.h>
+#include <faiss/impl/hnsw/MinimaxHeap.h>
 #include <faiss/impl/HNSW.h>
 #include <faiss/IndexHNSW.h>
 
@@ -202,7 +203,6 @@ typedef uint64_t size_t;
 #include <faiss/IndexNeuralNetCodec.h>
 
 #include <faiss/impl/RaBitQuantizer.h>
-#include <faiss/impl/RaBitQStats.h>
 #include <faiss/impl/RaBitQUtils.h>
 #include <faiss/IndexRaBitQ.h>
 #include <faiss/IndexRaBitQFastScan.h>
@@ -560,7 +560,10 @@ void gpu_sync_all_devices()
 %include  <faiss/IndexScalarQuantizer.h>
 %include  <faiss/IndexIVFSpectralHash.h>
 %include  <faiss/IndexIVFAdditiveQuantizer.h>
+%include  <faiss/impl/hnsw/MinimaxHeap.h>
 %include  <faiss/impl/HNSW.h>
+%ignore faiss::IndexHNSW::locks;
+%ignore faiss::IndexBinaryHNSW::locks;
 %include  <faiss/IndexHNSW.h>
 
 %include <faiss/impl/kmeans1d.h>
@@ -670,7 +673,6 @@ void gpu_sync_all_devices()
 %include <faiss/IndexNeuralNetCodec.h>
 
 %include <faiss/impl/RaBitQuantizer.h>
-%include <faiss/impl/RaBitQStats.h>
 %include <faiss/impl/RaBitQUtils.h>
 %include <faiss/IndexRaBitQ.h>
 %include <faiss/IndexRaBitQFastScan.h>
@@ -836,6 +838,7 @@ void gpu_sync_all_devices()
     DOWNCAST ( IndexHNSWFlat )
     DOWNCAST ( IndexHNSWPQ )
     DOWNCAST ( IndexHNSWSQ )
+    DOWNCAST ( IndexHNSWCagra )
     DOWNCAST ( IndexHNSW )
     DOWNCAST ( IndexHNSW2Level )
     DOWNCAST ( IndexNNDescentFlat )
