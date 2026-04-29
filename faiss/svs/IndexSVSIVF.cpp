@@ -186,16 +186,27 @@ void IndexSVSIVF::search(
                 FAISS_THROW_MSG(st.message());
             }
         }
+        size_t current_intra = 0;
+        impl->get_intra_query_threads(&current_intra);
+        if (intra_query_threads > 0 &&
+            current_intra != intra_query_threads) {
+            auto st = impl->set_intra_query_threads(intra_query_threads);
+            if (!st.ok()) {
+                FAISS_THROW_MSG(st.message());
+            }
+        }
     }
 
     auto sp = make_ivf_search_parameters(*this, params);
+    auto id_filter = make_faiss_id_filter(params);
     auto status = impl->search(
             static_cast<size_t>(n),
             x,
             static_cast<size_t>(k),
             distances,
             convert_output_buffer<size_t>(labels, static_cast<size_t>(n * k)),
-            &sp);
+            &sp,
+            id_filter.get());
 
     if (!status.ok()) {
         FAISS_THROW_MSG(status.message());

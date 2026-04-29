@@ -666,6 +666,8 @@ TEST_F(SVSLL, IVFLeanVec8x8TrainAndAdd) {
 
 TEST_F(SVS, IVFSearchWithIDSelector) {
     faiss::IndexSVSIVF index{d, 4ul};
+    // Use enough probes to give the filter a chance to find candidates.
+    index.n_probes = index.num_centroids;
     index.train(n, test_data.data());
     index.add(n, test_data.data());
 
@@ -683,13 +685,104 @@ TEST_F(SVS, IVFSearchWithIDSelector) {
     std::vector<float> distances(nq * k);
     std::vector<faiss::idx_t> labels(nq * k);
 
-    // The current SVS runtime IVFIndex::search() API does not accept an
-    // IDFilter parameter (unlike VamanaIndex::search()), so the IDSelector
-    // passed via SearchParameters is silently ignored. This test verifies
-    // that search still works (without filtering). Once the SVS runtime
-    // exposes IDFilter support for IVF search, this can be wired up the
-    // same way Vamana uses make_faiss_id_filter().
-    ASSERT_NO_THROW(index.search(nq, xq, k, distances.data(), labels.data()));
+    ASSERT_NO_THROW(
+            index.search(nq, xq, k, distances.data(), labels.data(), &params));
+
+    // All returned labels must fall inside the selected range
+    // (or be -1 sentinel if not enough candidates were found).
+    for (int i = 0; i < nq * k; ++i) {
+        if (labels[i] == -1) {
+            continue;
+        }
+        EXPECT_GE(labels[i], (faiss::idx_t)min_id);
+        EXPECT_LT(labels[i], (faiss::idx_t)max_id);
+    }
+}
+
+TEST_F(SVS, IVFSearchWithRestrictiveFilter) {
+    faiss::IndexSVSIVF index{d, 4ul};
+    // Use all probes so we exercise the adaptive filter loop end-to-end.
+    index.n_probes = index.num_centroids;
+    index.train(n, test_data.data());
+    index.add(n, test_data.data());
+
+    const int nq = 4;
+    const float* xq = test_data.data();
+    const int k = 5;
+
+    // Restrict to a narrow ID window (~10% of the dataset).
+    size_t min_id = 0;
+    size_t max_id = std::max<size_t>(k, n / 10);
+    faiss::IDSelectorRange selector(min_id, max_id);
+
+    faiss::SearchParameters params;
+    params.sel = &selector;
+
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+
+    ASSERT_NO_THROW(
+            index.search(nq, xq, k, distances.data(), labels.data(), &params));
+
+    for (int i = 0; i < nq * k; ++i) {
+        if (labels[i] == -1) {
+            continue;
+        }
+        EXPECT_GE(labels[i], (faiss::idx_t)min_id);
+        EXPECT_LT(labels[i], (faiss::idx_t)max_id);
+    }
+}
+
+TEST_F(SVS, IVFSetIntraQueryThreadsAfterTrain) {
+    faiss::IndexSVSIVF index{d, 4ul};
+    index.intra_query_threads = 1;
+    index.train(n, test_data.data());
+    index.add(n, test_data.data());
+
+    const int nq = 4;
+    const int k = 5;
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+
+    // Initial search establishes the backend pool with intra_query_threads=1.
+    ASSERT_NO_THROW(index.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+
+    // Bumping intra_query_threads after training and add() should be picked
+    // up by the next search() call (no exception, backend pool rebuilt).
+    index.intra_query_threads = 2;
+    ASSERT_NO_THROW(index.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+
+    size_t reported = 0;
+    auto st = index.impl->get_intra_query_threads(&reported);
+    ASSERT_TRUE(st.ok()) << st.message();
+    EXPECT_EQ(reported, 2u);
+}
+
+TEST_F(SVS, DynamicIVFSetIntraQueryThreadsAfterTrain) {
+    faiss::IndexSVSIVF index{
+            d, 4ul, faiss::METRIC_L2, faiss::SVSStorageKind::SVS_FP32, false};
+    index.intra_query_threads = 1;
+    index.train(n, test_data.data());
+    index.add(n, test_data.data());
+
+    const int nq = 4;
+    const int k = 5;
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k);
+
+    ASSERT_NO_THROW(index.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+
+    index.intra_query_threads = 2;
+    ASSERT_NO_THROW(index.search(
+            nq, test_data.data(), k, distances.data(), labels.data()));
+
+    size_t reported = 0;
+    auto st = index.impl->get_intra_query_threads(&reported);
+    ASSERT_TRUE(st.ok()) << st.message();
+    EXPECT_EQ(reported, 2u);
 }
 
 TEST_F(SVSLL, IVFLeanVecThrowsWithoutTraining) {
