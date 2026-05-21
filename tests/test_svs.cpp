@@ -238,6 +238,26 @@ TEST_F(SVSLL, WriteAndReadIndexSVSVamanaLeanVec8x8) {
     write_and_read_index(index, test_data, n);
 }
 
+TEST_F(SVSLL, WriteAndReadIndexSVSVamanaLeanVecLVQ4PrimaryOnly) {
+    faiss::IndexSVSVamanaLeanVec index{
+            d,
+            64ul,
+            faiss::METRIC_L2,
+            0,
+            faiss::SVSStorageKind::SVS_LeanVecLVQ4PrimaryOnly};
+    write_and_read_index(index, test_data, n);
+}
+
+TEST_F(SVSLL, WriteAndReadIndexSVSVamanaLeanVecLVQ8PrimaryOnly) {
+    faiss::IndexSVSVamanaLeanVec index{
+            d,
+            64ul,
+            faiss::METRIC_L2,
+            0,
+            faiss::SVSStorageKind::SVS_LeanVecLVQ8PrimaryOnly};
+    write_and_read_index(index, test_data, n);
+}
+
 TEST_F(SVSLL, LeanVecThrowsWithoutTraining) {
     faiss::IndexSVSVamanaLeanVec index{
             64,

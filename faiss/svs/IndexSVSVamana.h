@@ -52,6 +52,10 @@ enum SVSStorageKind {
     SVS_LeanVec4x4,
     SVS_LeanVec4x8,
     SVS_LeanVec8x8,
+    // Primary-only LeanVec variants (no secondary tier; ~50% less memory,
+    // no reranking). Vamana only.
+    SVS_LeanVecLVQ4PrimaryOnly,
+    SVS_LeanVecLVQ8PrimaryOnly,
     SVS_count,
 };
 
@@ -77,6 +81,10 @@ inline svs_runtime::StorageKind to_svs_storage_kind(SVSStorageKind kind) {
             return svs_runtime::StorageKind::LeanVec4x8;
         case SVS_LeanVec8x8:
             return svs_runtime::StorageKind::LeanVec8x8;
+        case SVS_LeanVecLVQ4PrimaryOnly:
+            return svs_runtime::StorageKind::LeanVecLVQ4PrimaryOnly;
+        case SVS_LeanVecLVQ8PrimaryOnly:
+            return svs_runtime::StorageKind::LeanVecLVQ8PrimaryOnly;
         default:
             FAISS_THROW_FMT(
                     "SVSStorageKind (%d) not supported",
